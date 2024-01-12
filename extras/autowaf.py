@@ -5,7 +5,10 @@ import sys
 import time
 
 from waflib import Configure, ConfigSet, Build, Context, Logs, Options, Utils
-from waflib.TaskGen import feature, before, after, after_method
+from waflib.TaskGen import feature, before, after
+
+global g_is_child
+g_is_child = False
 
 NONEMPTY = -10
 
@@ -20,32 +23,10 @@ else:
 # import preproc
 # preproc.go_absolute = True
 
-
 @feature('c', 'cxx')
 @after('apply_incpaths')
 def include_config_h(self):
     self.env.append_value('INCPATHS', self.bld.bldnode.abspath())
-
-
-def _set_system_headers(self, varname):
-    if 'AUTOWAF_SYSTEM_PKGS' in self.env and not self.env.MSVC_COMPILER:
-        for lib in self.uselib:
-            if lib in self.env.AUTOWAF_SYSTEM_PKGS:
-                for include in self.env['INCLUDES_' + lib]:
-                    self.env.append_unique(varname, ['-isystem%s' % include])
-
-
-@feature('c')
-@after_method('apply_incpaths')
-def set_system_headers_c(self):
-    _set_system_headers(self, 'CFLAGS')
-
-
-@feature('cxx')
-@after_method('apply_incpaths')
-def set_system_headers_cxx(self):
-    _set_system_headers(self, 'CXXFLAGS')
-
 
 class OptionsContext(Options.OptionsContext):
     def __init__(self, **kwargs):
@@ -61,8 +42,7 @@ class OptionsContext(Options.OptionsContext):
             group.add_option('--' + name, action='store_true',
                              dest=name.replace('-', '_'), help=desc)
 
-
-def set_options(opt):
+def set_options(opt, debug_by_default=False):
     "Add standard autowaf options"
     opts = opt.get_option_group('Configuration options')
 
@@ -83,11 +63,15 @@ def set_options(opt):
                     help="HTML documentation [default: DATADIR/doc]")
 
     # Build options
-    opts.add_option('-d', '--debug', action='store_true', default=False,
-                    dest='debug', help="build debuggable binaries")
-    opts.add_option('--pardebug', action='store_true', default=False,
-                    dest='pardebug',
-                    help="build debug libraries with D suffix")
+    if debug_by_default:
+        opts.add_option('--optimize', action='store_false', default=True,
+                        dest='debug', help="build optimized binaries")
+    else:
+        opts.add_option('-d', '--debug', action='store_true', default=False,
+                        dest='debug', help="build debuggable binaries")
+        opts.add_option('--pardebug', action='store_true', default=False,
+                        dest='pardebug',
+                        help="build debug libraries with D suffix")
 
     opts.add_option('-s', '--strict', action='store_true', default=False,
                     dest='strict',
@@ -97,29 +81,18 @@ def set_options(opt):
                     help="use extremely strict compiler flags (likely noisy)")
     opts.add_option('--docs', action='store_true', default=False, dest='docs',
                     help="build documentation (requires doxygen)")
-    opts.add_option('-w', '--werror', action='store_true', dest='werror',
-                    help="Treat warnings as errors")
 
     # Test options
     if hasattr(Context.g_module, 'test'):
         test_opts = opt.add_option_group('Test options', '')
-        opts.add_option('-T', '--test', action='store_true',
-                        dest='build_tests', help='build unit tests')
+        opts.add_option('-T', '--test', action='store_true', dest='build_tests',
+                        help='build unit tests')
         opts.add_option('--no-coverage', action='store_true',
                         dest='no_coverage',
                         help='do not instrument code for test coverage')
-        test_opts.add_option('--test-filter', type='string',
-                             dest='test_filter',
-                             help='regular expression for tests to run')
-
-    # Run options
-    run_opts = opt.add_option_group('Run options')
-    run_opts.add_option('--cmd', type='string', dest='cmd',
-                        help='command to run from build directory')
-    run_opts.add_option('--wrapper', type='string',
-                        dest='wrapper',
-                        help='command prefix for running executables')
-
+        test_opts.add_option('--wrapper', type='string',
+                             dest='test_wrapper',
+                             help='command prefix for tests (e.g. valgrind)')
 
 class ConfigureContext(Configure.ConfigurationContext):
     """configures the project"""
@@ -131,26 +104,25 @@ class ConfigureContext(Configure.ConfigurationContext):
 
         super(ConfigureContext, self).__init__(**kwargs)
         self.run_env = ConfigSet.ConfigSet()
+        self.system_include_paths = set()
 
     def pre_recurse(self, node):
-        if len(self.stack_path) == 1:
-            Logs.pprint('BOLD', 'Configuring %s' % node.parent.srcpath())
+        display_header('Configuring %s' % node.parent.srcpath())
         super(ConfigureContext, self).pre_recurse(node)
 
     def store(self):
         self.env.AUTOWAF_RUN_ENV = self.run_env.get_merged_dict()
+        for path in sorted(self.system_include_paths):
+            if 'COMPILER_CC' in self.env:
+                self.env.append_value('CFLAGS', ['-isystem', path])
+            if 'COMPILER_CXX' in self.env:
+                self.env.append_value('CXXFLAGS', ['-isystem', path])
+
         super(ConfigureContext, self).store()
-
-    def check_pkg(self, *args, **kwargs):
-        return check_pkg(self, *args, **kwargs)
-
-    def check_function(self, *args, **kwargs):
-        return check_function(self, *args, **kwargs)
 
     def build_path(self, path='.'):
         """Return `path` within the build directory"""
-        return str(self.path.get_bld().make_node(path))
-
+        return str(self.path.get_bld().find_node(path))
 
 def get_check_func(conf, lang):
     if lang == 'c':
@@ -159,7 +131,6 @@ def get_check_func(conf, lang):
         return conf.check_cxx
     else:
         Logs.error("Unknown header language `%s'" % lang)
-
 
 def check_header(conf, lang, name, define='', mandatory=True):
     "Check for a header"
@@ -171,332 +142,80 @@ def check_header(conf, lang, name, define='', mandatory=True):
     else:
         check_func(header_name=name, mandatory=mandatory)
 
-
 def check_function(conf, lang, name, **args):
     "Check for a function"
     header_names = Utils.to_list(args['header_name'])
     includes = ''.join(['#include <%s>\n' % x for x in header_names])
-    return_type = args['return_type'] if 'return_type' in args else 'int'
-    arg_types = args['arg_types'] if 'arg_types' in args else ''
-
     fragment = '''
 %s
-
-typedef %s (*Func)(%s);
-
-int main(void) {
-    static const Func ptr = %s;
-    (void)ptr;
-    return 0;
-}
-''' % (includes, return_type, arg_types, name)
+int main() { return !(void(*)())(%s); }
+''' % (includes, name)
 
     check_func  = get_check_func(conf, lang)
     args['msg'] = 'Checking for %s' % name
-    if lang + 'flags' not in args:
-        args[lang + 'flags'] = check_flags(conf, conf.env.CFLAGS)
-
     check_func(fragment=fragment, **args)
-
 
 def nameify(name):
     return (name.replace('/', '_').replace('++', 'PP')
             .replace('-', '_').replace('.', '_'))
 
+def define(conf, var_name, value):
+    conf.define(var_name, value)
+    conf.env[var_name] = value
 
-def check_pkg(conf, spec, **kwargs):
+def check_pkg(conf, name, **args):
     "Check for a package iff it hasn't been checked for yet"
-
-    uselib_store = kwargs['uselib_store']
-    is_local = (uselib_store.lower() in conf.env['AUTOWAF_LOCAL_LIBS'] or
-                uselib_store.lower() in conf.env['AUTOWAF_LOCAL_HEADERS'])
-
-    if is_local:
+    if args['uselib_store'].lower() in conf.env['AUTOWAF_LOCAL_LIBS']:
         return
 
-    import re
-    match = re.match(r'([^ ]*) >= [0-9\.]*', spec)
-    args = []
-    if match:
-        name = match.group(1)
-        args = [spec]
-    elif spec.find(' ') == -1:
-        name = spec
-    else:
-        Logs.error("Invalid package spec: %s" % spec)
+    class CheckType:
+        OPTIONAL = 1
+        MANDATORY = 2
 
-    found = None
-    pkg_name = name
-    args += kwargs.get('args', [])
-
-    if conf.env.PARDEBUG:
-        kwargs['mandatory'] = False  # Smash mandatory arg
-        found = conf.check_cfg(package=pkg_name + 'D',
-                               args=args + ['--cflags', '--libs'])
+    var_name = 'CHECKED_' + nameify(args['uselib_store'])
+    check = var_name not in conf.env
+    mandatory = 'mandatory' not in args or args['mandatory']
+    if not check and 'atleast_version' in args:
+        # Re-check if version is newer than previous check
+        checked_version = conf.env['VERSION_' + name]
+        if checked_version and checked_version < args['atleast_version']:
+            check = True
+    if not check and mandatory and conf.env[var_name] == CheckType.OPTIONAL:
+        # Re-check if previous check was optional but this one is mandatory
+        check = True
+    if check:
+        found = None
+        pkg_var_name = 'PKG_' + name.replace('-', '_')
+        pkg_name = name
+        if conf.env.PARDEBUG:
+            args['mandatory'] = False  # Smash mandatory arg
+            found = conf.check_cfg(package=pkg_name + 'D',
+                                   args="--cflags --libs", **args)
+            if found:
+                pkg_name += 'D'
+        if mandatory:
+            args['mandatory'] = True  # Unsmash mandatory arg
+        if not found:
+            found = conf.check_cfg(package=pkg_name, args="--cflags --libs",
+                                   **args)
         if found:
-            pkg_name += 'D'
+            conf.env[pkg_var_name] = pkg_name
+        if 'atleast_version' in args:
+            conf.env['VERSION_' + name] = args['atleast_version']
+    if mandatory:
+        conf.env[var_name] = CheckType.MANDATORY
+    else:
+        conf.env[var_name] = CheckType.OPTIONAL
 
-        args['mandatory'] = kwargs['mandatory']  # Unsmash mandatory arg
-
-    if not found:
-        found = conf.check_cfg(package=spec,
-                               args=args + ['--cflags', '--libs'],
-                               **kwargs)
-
-    if not conf.env.MSVC_COMPILER and 'system' in kwargs and kwargs['system']:
-        conf.env.append_unique('AUTOWAF_SYSTEM_PKGS', uselib_store)
-
+    if not conf.env.MSVC_COMPILER and 'system' in args and args['system']:
+        conf.system_include_paths.update(
+            conf.env['INCLUDES_' + nameify(args['uselib_store'])])
 
 def normpath(path):
     if sys.platform == 'win32':
         return os.path.normpath(path).replace('\\', '/')
     else:
         return os.path.normpath(path)
-
-
-# Almost all GCC warnings common to C and C++
-gcc_common_warnings = [
-  # '-Waggregate-return', # Pretty esoteric, and not in clang
-  '-Waggressive-loop-optimizations',
-  '-Wall',
-  '-Walloc-zero',
-  '-Walloca',
-  # '-Walloca-larger-than=',
-  '-Wattribute-alias',
-  '-Wattributes',
-  '-Wbuiltin-declaration-mismatch',
-  '-Wbuiltin-macro-redefined',
-  '-Wcast-align',
-  '-Wcast-align=strict',
-  '-Wcast-qual',
-  '-Wconversion',
-  '-Wcoverage-mismatch',
-  '-Wcpp',
-  '-Wdate-time',
-  '-Wdeprecated',
-  '-Wdeprecated-declarations',
-  '-Wdisabled-optimization',
-  '-Wdiv-by-zero',
-  '-Wdouble-promotion',
-  '-Wduplicated-branches',
-  '-Wduplicated-cond',
-  '-Wextra',
-  '-Wfloat-equal',
-  '-Wformat-signedness',
-  '-Wnormalized',
-  # '-Wframe-larger-than=',
-  '-Wfree-nonheap-object',
-  '-Whsa',
-  '-Wif-not-aligned',
-  '-Wignored-attributes',
-  '-Winline',
-  '-Wint-to-pointer-cast',
-  '-Winvalid-memory-model',
-  '-Winvalid-pch',
-  # '-Wlarger-than=',
-  '-Wlogical-op',
-  '-Wlto-type-mismatch',
-  '-Wmissing-declarations',
-  '-Wmissing-include-dirs',
-  '-Wmultichar',
-  '-Wnull-dereference',
-  '-Wodr',
-  '-Woverflow',
-  '-Wpacked',
-  '-Wpacked-bitfield-compat',
-  '-Wpadded',
-  '-Wpedantic',
-  '-Wpointer-compare',
-  '-Wpragmas',
-  '-Wredundant-decls',
-  '-Wreturn-local-addr',
-  '-Wscalar-storage-order',
-  '-Wshadow',
-  '-Wshift-count-negative',
-  '-Wshift-count-overflow',
-  '-Wshift-negative-value',
-  '-Wshift-overflow=2',
-  '-Wsizeof-array-argument',
-  '-Wstack-protector',
-  # '-Wstack-usage=',
-  '-Wstrict-aliasing',
-  '-Wstrict-overflow',
-  '-Wsuggest-attribute=cold',
-  '-Wsuggest-attribute=const',
-  '-Wsuggest-attribute=format',
-  '-Wsuggest-attribute=malloc',
-  '-Wsuggest-attribute=noreturn',
-  '-Wsuggest-attribute=pure',
-  '-Wswitch-bool',
-  '-Wnormalized',
-  # '-Wswitch-default', # Redundant with Wswitch and not in clang
-  '-Wswitch-enum',
-  '-Wswitch-unreachable',
-  '-Wsync-nand',
-  # '-Wsystem-headers',
-  '-Wtrampolines',
-  '-Wundef',
-  '-Wunused-macros',
-  '-Wunused-result',
-  '-Wvarargs',
-  '-Wvector-operation-performance',
-  '-Wvla',
-  # '-Wvla-larger-than=',
-  '-Wwrite-strings',
-]
-
-# Almost all C-specific GCC warnings, except those for ancient (pre-C99) C
-gcc_c_warnings = [
-  '-Wbad-function-cast',
-  '-Wc++-compat',
-  # '-Wc90-c99-compat',
-  '-Wc99-c11-compat',
-  # '-Wdeclaration-after-statement',
-  '-Wdesignated-init',
-  '-Wdiscarded-array-qualifiers',
-  '-Wdiscarded-qualifiers',
-  '-Wincompatible-pointer-types',
-  '-Wint-conversion',
-  '-Wjump-misses-init',
-  '-Wmissing-prototypes',
-  '-Wnested-externs',
-  '-Wold-style-definition',
-  '-Woverride-init-side-effects',
-  '-Wpointer-to-int-cast',
-  '-Wstrict-prototypes',
-  # '-Wtraditional',
-  # '-Wtraditional-conversion',
-  # '-Wunsuffixed-float-constants',
-]
-
-# Almost all C++-specific GCC warnings, except those about common feature use
-gcc_cxx_warnings = [
-  '-Wconditionally-supported',
-  '-Wconversion-null',
-  '-Wctor-dtor-privacy',
-  '-Wdelete-incomplete',
-  '-Weffc++',
-  '-Wextra-semi',
-  '-Winherited-variadic-ctor',
-  '-Winvalid-offsetof',
-  '-Wliteral-suffix',
-  '-Wmultiple-inheritance',
-  # '-Wnamespaces',
-  '-Wnoexcept',
-  '-Wnon-template-friend',
-  '-Wnon-virtual-dtor',
-  '-Wold-style-cast',
-  '-Woverloaded-virtual',
-  '-Wplacement-new=2',
-  '-Wpmf-conversions',
-  '-Wregister',
-  '-Wsign-promo',
-  '-Wstrict-null-sentinel',
-  '-Wsubobject-linkage',
-  '-Wsuggest-final-methods',
-  '-Wsuggest-final-types',
-  '-Wsuggest-override',
-  '-Wsynth',
-  # '-Wtemplates',
-  '-Wterminate',
-  '-Wuseless-cast',
-  '-Wvirtual-inheritance',
-  '-Wvirtual-move-assign',
-  '-Wzero-as-null-pointer-constant',
-]
-
-
-def remove_all_warning_flags(env):
-    """Removes all warning flags except Werror or equivalent"""
-    if 'CC' in env:
-        if 'clang' in env.CC_NAME or 'gcc' in env.CC_NAME:
-            env['CFLAGS'] = [f for f in env['CFLAGS']
-                             if not (f.startswith('-W') and f != '-Werror')]
-        elif 'msvc' in env.CC_NAME:
-            env['CFLAGS'] = [f for f in env['CFLAGS']
-                             if not (f.startswith('/W') and f != '/WX')]
-
-    if 'CXX' in env:
-        if 'clang' in env.CXX_NAME or 'gcc' in env.CXX_NAME:
-            env['CXXFLAGS'] = [f for f in env['CXXFLAGS']
-                               if not (f.startswith('-W') and f != '-Werror')]
-        elif 'msvc' in env.CXX_NAME:
-            env['CXXFLAGS'] = [f for f in env['CXXFLAGS']
-                               if not (f.startswith('/W') and f != '/WX')]
-
-
-def enable_all_warnings(env):
-    """Enables all known warnings"""
-    if 'CC' in env:
-        if 'clang' in env.CC_NAME:
-            env.append_unique('CFLAGS', [
-                '-Weverything',
-                '-Wno-poison-system-directories',
-            ])
-        elif 'gcc' in env.CC_NAME:
-            env.append_unique('CFLAGS', gcc_common_warnings)
-            env.append_unique('CFLAGS', gcc_c_warnings)
-        elif env.MSVC_COMPILER:
-            env.append_unique('CFLAGS', ['/Wall'])
-        else:
-            Logs.warn('Unknown compiler "%s", not enabling warnings' % env.CC_NAME)
-
-    if 'CXX' in env:
-        if 'clang' in env.CXX_NAME:
-            env.append_unique('CXXFLAGS', [
-                '-Weverything',
-                '-Wno-c++98-compat',
-                '-Wno-c++98-compat-pedantic',
-                '-Wno-poison-system-directories',
-            ])
-        elif 'gcc' in env.CXX_NAME:
-            env.append_unique('CXXFLAGS', gcc_common_warnings)
-            env.append_unique('CXXFLAGS', gcc_cxx_warnings)
-        elif env.MSVC_COMPILER:
-            env.append_unique('CXXFLAGS', ['/Wall'])
-        else:
-            Logs.warn('Unknown compiler "%s", not enabling warnings' % env.CXX_NAME)
-
-
-def set_warnings_as_errors(env):
-    if 'CC' in env:
-        if 'clang' in env.CC_NAME or 'gcc' in env.CC_NAME:
-            env.append_unique('CFLAGS', ['-Werror'])
-        elif env.MSVC_COMPILER:
-            env.append_unique('CFLAGS', ['/WX'])
-
-    if 'CXX' in env:
-        if 'clang' in env.CXX_NAME or 'gcc' in env.CXX_NAME:
-            env.append_unique('CXXFLAGS', ['-Werror'])
-        elif env.MSVC_COMPILER:
-            env.append_unique('CXXFLAGS', ['/WX'])
-
-
-def add_compiler_flags(env, lang, compiler_to_flags):
-    """Add compiler-specific flags, for example to suppress warnings.
-
-    The lang argument must be "c", "cxx", or "*" for both.
-
-    The compiler_to_flags argument must be a map from compiler name
-    ("clang", "gcc", or "msvc") to a list of command line flags.
-    """
-
-    if lang == "*":
-        add_compiler_flags(env, 'c', compiler_to_flags)
-        add_compiler_flags(env, 'cxx', compiler_to_flags)
-    else:
-        if lang == 'c':
-            compiler_name = env.CC_NAME
-        elif lang == 'cxx':
-            compiler_name = env.CXX_NAME
-        else:
-            raise Exception('Unknown language "%s"' % lang)
-
-        var_name = lang.upper() + 'FLAGS'
-        for name, flags in compiler_to_flags.items():
-            if name in compiler_name:
-                env.append_value(var_name, flags)
-
 
 def configure(conf):
     def append_cxx_flags(flags):
@@ -538,71 +257,79 @@ def configure(conf):
 
     if Options.options.debug:
         if conf.env['MSVC_COMPILER']:
-            conf.env['CFLAGS']    = ['/Od', '/Z7']
-            conf.env['CXXFLAGS']  = ['/Od', '/Z7']
+            conf.env['CFLAGS']    = ['/Od', '/Z7', '/MTd', '/FS']
+            conf.env['CXXFLAGS']  = ['/Od', '/Z7', '/MTd', '/FS']
             conf.env['LINKFLAGS'] = ['/DEBUG', '/MANIFEST']
         else:
             conf.env['CFLAGS']   = ['-O0', '-g']
             conf.env['CXXFLAGS'] = ['-O0', '-g']
     else:
-        if 'CFLAGS' not in os.environ:
-            if conf.env['MSVC_COMPILER']:
-                conf.env.append_unique('CFLAGS', ['/O2', '/DNDEBUG'])
-            else:
-                conf.env.append_unique('CFLAGS', ['-O2', '-DNDEBUG'])
-
-        if 'CXXFLAGS' not in os.environ:
-            if conf.env['MSVC_COMPILER']:
-                conf.env.append_unique('CXXFLAGS', ['/O2', '/DNDEBUG'])
-            else:
-                conf.env.append_unique('CXXFLAGS', ['-O2', '-DNDEBUG'])
-
-    if conf.env['MSVC_COMPILER']:
-        conf.env['CFLAGS']   += ['/MD']
-        conf.env['CXXFLAGS'] += ['/MD']
-
-    if Options.options.ultra_strict:
-        Options.options.strict = True
-        remove_all_warning_flags(conf.env)
-        enable_all_warnings(conf.env)
-        if Options.options.werror and 'clang' in conf.env.CC_NAME:
-            conf.env.append_unique('CFLAGS', '-Wno-unknown-warning-option')
-        if Options.options.werror and 'clang' in conf.env.CXX_NAME:
-            conf.env.append_unique('CXXFLAGS', '-Wno-unknown-warning-option')
+        if conf.env['MSVC_COMPILER']:
+            append_cxx_flags(['/MD', '/FS', '/DNDEBUG'])
+        else:
+            append_cxx_flags(['-DNDEBUG'])
 
     if conf.env.MSVC_COMPILER:
         Options.options.no_coverage = True
         append_cxx_flags(['/nologo',
                           '/FS',
+                          '/DNDEBUG',
                           '/D_CRT_SECURE_NO_WARNINGS',
                           '/experimental:external',
                           '/external:W0',
                           '/external:anglebrackets'])
-        conf.env.append_unique('CXXFLAGS', ['/EHsc'])
         conf.env.append_value('LINKFLAGS', '/nologo')
-    elif Options.options.strict:
-        if conf.env.DEST_OS != "darwin":
-            sanitizing = False
-            for f in conf.env.LINKFLAGS:
-                if f.startswith('-fsanitize'):
-                    sanitizing = True
-                    break;
+        if Options.options.strict or Options.options.ultra_strict:
+            ms_strict_flags = ['/Wall',
+                               '/wd4061',
+                               '/wd4200',
+                               '/wd4514',
+                               '/wd4571',
+                               '/wd4625',
+                               '/wd4626',
+                               '/wd4706',
+                               '/wd4710',
+                               '/wd4820',
+                               '/wd5026',
+                               '/wd5027',
+                               '/wd5045']
+            conf.env.append_value('CFLAGS', ms_strict_flags)
+            conf.env.append_value('CXXFLAGS', ms_strict_flags)
+            conf.env.append_value('CXXFLAGS', ['/EHsc'])
+    else:
+        if Options.options.ultra_strict:
+            Options.options.strict = True
+            conf.env.append_value('CFLAGS', ['-Wredundant-decls',
+                                             '-Wstrict-prototypes',
+                                             '-Wmissing-prototypes',
+                                             '-Wcast-qual'])
+            conf.env.append_value('CXXFLAGS', ['-Wcast-qual'])
 
-            if not sanitizing:
+        if Options.options.strict:
+            conf.env.append_value('CFLAGS', ['-pedantic', '-Wshadow'])
+            if conf.env.DEST_OS != "darwin":
                 conf.env.append_value('LINKFLAGS', ['-Wl,--no-undefined'])
+            conf.env.append_value('CXXFLAGS', ['-Wnon-virtual-dtor',
+                                               '-Woverloaded-virtual'])
+            append_cxx_flags(['-Wall',
+                              '-Wcast-align',
+                              '-Wextra',
+                              '-Wmissing-declarations',
+                              '-Wno-unused-parameter',
+                              '-Wstrict-overflow',
+                              '-Wundef',
+                              '-Wwrite-strings',
+                              '-fstrict-overflow'])
 
             # Add less universal flags after checking they work
             extra_flags = ['-Wlogical-op',
                            '-Wsuggest-attribute=noreturn',
                            '-Wunsafe-loop-optimizations']
-            cflags = flag_check_flags(conf, conf.env.CFLAGS) + extra_flags
-            if conf.check_cc(cflags=cflags,
-                             mandatory=False,
+            if conf.check_cc(cflags=['-Werror'] + extra_flags, mandatory=False,
                              msg="Checking for extra C warning flags"):
                 conf.env.append_value('CFLAGS', extra_flags)
             if 'COMPILER_CXX' in conf.env:
-                cxxflags = flag_check_flags(conf, conf.env.CXXFLAGS) + extra_flags
-                if conf.check_cxx(cxxflags=cxxflags,
+                if conf.check_cxx(cxxflags=['-Werror'] + extra_flags,
                                   mandatory=False,
                                   msg="Checking for extra C++ warning flags"):
                     conf.env.append_value('CXXFLAGS', extra_flags)
@@ -610,18 +337,12 @@ def configure(conf):
     if not conf.env['MSVC_COMPILER']:
         append_cxx_flags(['-fshow-column'])
 
-    if Options.options.werror:
-        if conf.env.MSVC_COMPILER:
-            append_cxx_flags('/WX')
-        else:
-            append_cxx_flags('-Werror')
-
     conf.env.NO_COVERAGE = True
     conf.env.BUILD_TESTS = False
     try:
         conf.env.BUILD_TESTS = Options.options.build_tests
         conf.env.NO_COVERAGE = Options.options.no_coverage
-        if conf.env.BUILD_TESTS and not Options.options.no_coverage:
+        if not Options.options.no_coverage:
             # Set up unit test code coverage
             if conf.is_defined('CLANG'):
                 for cov in [conf.env.CC[0].replace('clang', 'llvm-cov'),
@@ -629,33 +350,23 @@ def configure(conf):
                     if conf.find_program(cov, var='LLVM_COV', mandatory=False):
                         break
             else:
-                if 'CC' in conf.env:
-                    if conf.check_cc(cflags=check_flags(conf, conf.env.CFLAGS),
-                                lib='gcov',
-                                mandatory=False,
-                                uselib_store='GCOV'):
-                        conf.env.HAVE_GCOV = True
-                else:
-                    if conf.check_cxx(cflags=check_flags(conf, conf.env.CXXFLAGS),
-                                 lib='gcov',
-                                 mandatory=False,
-                                 uselib_store='GCOV'):
-                        conf.env.HAVE_GCOV = True
-    except AttributeError:
-        pass # Test options do not exist
-    except Exception as e:
-        Logs.error("error: %s" % e)
+                conf.check_cc(lib='gcov', define_name='HAVE_GCOV',
+                              mandatory=False)
+    except Exception:
+        pass  # Test options do not exist
 
     # Define version in configuration
     appname = getattr(Context.g_module, Context.APPNAME, 'noname')
     version = getattr(Context.g_module, Context.VERSION, '0.0.0')
     defname = appname.upper().replace('-', '_').replace('.', '_')
-    conf.define(defname + '_VERSION', version)
-    conf.env[defname + '_VERSION'] = version
+    define(conf, defname + '_VERSION', version)
 
+    conf.env.prepend_value('CFLAGS', '-I' + os.path.abspath('.'))
+    conf.env.prepend_value('CXXFLAGS', '-I' + os.path.abspath('.'))
 
 def display_summary(conf, msgs=None):
-    if len(conf.stack_path) == 1:
+    global g_is_child
+    if not g_is_child:
         display_msg(conf, "Install prefix", conf.env['PREFIX'])
         if 'COMPILER_CC' in conf.env:
             display_msg(conf, "C Flags", ' '.join(conf.env['CFLAGS']))
@@ -667,44 +378,16 @@ def display_summary(conf, msgs=None):
     if msgs is not None:
         display_msgs(conf, msgs)
 
-
-def check_flags(conf, flags):
-    if conf.env.MSVC_COMPILER:
-        return []
-
-    # Disable silly attribute warnings that trigger in the generated check code
-    result = []
-    if '-Wsuggest-attribute=const' in flags:
-        result += ['-Wno-suggest-attribute=const']
-    if '-Wsuggest-attribute=pure' in flags:
-        result += ['-Wno-suggest-attribute=pure']
-
-    return result
-
-
-def flag_check_flags(conf, flags):
-    if conf.env.MSVC_COMPILER:
-        return ['/WX'] + check_flags(conf, flags)
-    else:
-        return ['-Werror'] + check_flags(conf, flags)
-
-
-def set_c_lang(conf, lang, **kwargs):
+def set_c_lang(conf, lang):
     "Set a specific C language standard, like 'c99' or 'c11'"
     if conf.env.MSVC_COMPILER:
         # MSVC has no hope or desire to compile C99, just compile as C++
         conf.env.append_unique('CFLAGS', ['/TP'])
-        return True
-    elif not (lang == 'c99' and '-std=c11' in conf.env.CFLAGS):
+    else:
         flag = '-std=%s' % lang
-        if conf.check(features='c cstlib',
-                      cflags=flag_check_flags(conf, conf.env.CFLAGS) + [flag],
-                      msg="Checking for flag '%s'" % flag,
-                      **kwargs):
-            conf.env.append_unique('CFLAGS', [flag])
-            return True
-        return False
-
+        conf.check(cflags=['-Werror', flag],
+                   msg="Checking for flag '%s'" % flag)
+        conf.env.append_unique('CFLAGS', [flag])
 
 def set_cxx_lang(conf, lang):
     "Set a specific C++ language standard, like 'c++11', 'c++14', or 'c++17'"
@@ -714,10 +397,9 @@ def set_cxx_lang(conf, lang):
         conf.env.append_unique('CXXFLAGS', ['/std:%s' % lang])
     else:
         flag = '-std=%s' % lang
-        conf.check(cxxflags=flag_check_flags(conf, conf.env.CXXFLAGS) + [flag],
+        conf.check(cxxflags=['-Werror', flag],
                    msg="Checking for flag '%s'" % flag)
         conf.env.append_unique('CXXFLAGS', [flag])
-
 
 def set_modern_c_flags(conf):
     "Use the most modern C language available"
@@ -732,7 +414,6 @@ def set_modern_c_flags(conf):
                     conf.env.append_unique('CFLAGS', [flag])
                     break
 
-
 def set_modern_cxx_flags(conf, mandatory=False):
     "Use the most modern C++ language available"
     if 'COMPILER_CXX' in conf.env:
@@ -746,11 +427,9 @@ def set_modern_cxx_flags(conf, mandatory=False):
                     conf.env.append_unique('CXXFLAGS', [flag])
                     break
 
-
 def set_local_lib(conf, name, has_objects):
     var_name = 'HAVE_' + nameify(name.upper())
-    conf.define(var_name, 1)
-    conf.env[var_name] = 1
+    define(conf, var_name, 1)
     if has_objects:
         if type(conf.env['AUTOWAF_LOCAL_LIBS']) != dict:
             conf.env['AUTOWAF_LOCAL_LIBS'] = {}
@@ -760,13 +439,31 @@ def set_local_lib(conf, name, has_objects):
             conf.env['AUTOWAF_LOCAL_HEADERS'] = {}
         conf.env['AUTOWAF_LOCAL_HEADERS'][name.lower()] = True
 
-
 def append_property(obj, key, val):
     if hasattr(obj, key):
         setattr(obj, key, getattr(obj, key) + val)
     else:
         setattr(obj, key, val)
 
+def use_lib(bld, obj, libs):
+    abssrcdir = os.path.abspath('.')
+    libs_list = libs.split()
+    for l in libs_list:
+        in_headers = l.lower() in bld.env['AUTOWAF_LOCAL_HEADERS']
+        in_libs    = l.lower() in bld.env['AUTOWAF_LOCAL_LIBS']
+        if in_libs:
+            append_property(obj, 'use', ' lib%s ' % l.lower())
+            append_property(obj, 'framework', bld.env['FRAMEWORK_' + l])
+        if in_headers or in_libs:
+            if bld.env.MSVC_COMPILER:
+                inc_flag = '/I' + os.path.join(abssrcdir, l.lower())
+            else:
+                inc_flag = '-iquote ' + os.path.join(abssrcdir, l.lower())
+            for f in ['CFLAGS', 'CXXFLAGS']:
+                if inc_flag not in bld.env[f]:
+                    bld.env.prepend_value(f, inc_flag)
+        else:
+            append_property(obj, 'uselib', ' ' + l)
 
 @feature('c', 'cxx')
 @before('apply_link')
@@ -778,38 +475,27 @@ def version_lib(self):
         if [x for x in applicable if x in self.features]:
             self.target = self.target + 'D'
 
-
-def set_lib_env(conf,
-                name,
-                version,
-                has_objects=True,
-                include_path=None,
-                lib_path=None,
-                lib=None):
+def set_lib_env(conf, name, version):
     "Set up environment for local library as if found via pkg-config."
     NAME         = name.upper()
     major_ver    = version.split('.')[0]
     pkg_var_name = 'PKG_' + name.replace('-', '_') + '_' + major_ver
-    lib_name     = '%s-%s' % (lib if lib is not None else name, major_ver)
-
-    if lib_path is None:
-        lib_path = str(conf.path.get_bld())
-
-    if include_path is None:
-        include_path = str(conf.path)
-
+    lib_name     = '%s-%s' % (name, major_ver)
+    lib_path     = [str(conf.path.get_bld())]
     if conf.env.PARDEBUG:
         lib_name += 'D'
-
     conf.env[pkg_var_name]       = lib_name
-    conf.env['INCLUDES_' + NAME] = [include_path]
-    conf.env['LIBPATH_' + NAME]  = [lib_path]
-    if has_objects:
-        conf.env['LIB_' + NAME] = [lib_name]
+    conf.env['INCLUDES_' + NAME] = ['${INCLUDEDIR}/%s-%s' % (name, major_ver)]
+    conf.env['LIBPATH_' + NAME]  = lib_path
+    conf.env['LIB_' + NAME]      = [lib_name]
 
-    conf.run_env.append_unique(lib_path_name, [lib_path])
+    conf.run_env.append_unique(lib_path_name, lib_path)
     conf.define(NAME + '_VERSION', version)
 
+def display_header(title):
+    global g_is_child
+    if g_is_child:
+        Logs.pprint('BOLD', title)
 
 def display_msg(conf, msg, status=None, color=None):
     color = 'CYAN'
@@ -823,40 +509,37 @@ def display_msg(conf, msg, status=None, color=None):
     Logs.pprint('BOLD', ":", sep='')
     Logs.pprint(color, status)
 
-
 def display_msgs(conf, msgs):
     for k, v in msgs.items():
         display_msg(conf, k, v)
-
 
 def link_flags(env, lib):
     return ' '.join(map(lambda x: env['LIB_ST'] % x,
                         env['LIB_' + lib]))
 
-
 def compile_flags(env, lib):
     return ' '.join(map(lambda x: env['CPPPATH_ST'] % x,
                         env['INCLUDES_' + lib]))
 
+def set_recursive():
+    global g_is_child
+    g_is_child = True
+
+def is_child():
+    global g_is_child
+    return g_is_child
 
 def build_pc(bld, name, version, version_suffix, libs, subst_dict={}):
     """Build a pkg-config file for a library.
 
     name           -- uppercase variable name     (e.g. 'SOMENAME')
-                      or path to template without .pc.in extension
     version        -- version string              (e.g. '1.2.3')
     version_suffix -- name version suffix         (e.g. '2')
     libs           -- string/list of dependencies (e.g. 'LIBFOO GLIB')
     """
 
-    if '/' in name:
-        source = '%s.pc.in' % name.lower()
-        name = os.path.basename(name)
-    else:
-        source = '%s.pc.in' % name.lower()
-
     pkg_prefix       = bld.env['PREFIX']
-    if len(pkg_prefix) > 1 and pkg_prefix[-1] == '/':
+    if pkg_prefix[-1] == '/':
         pkg_prefix = pkg_prefix[:-1]
 
     target = name.lower()
@@ -877,7 +560,7 @@ def build_pc(bld, name, version, version_suffix, libs, subst_dict={}):
         includedir = includedir.replace(pkg_prefix, '${prefix}')
 
     obj = bld(features='subst',
-              source=source,
+              source='%s.pc.in' % name.lower(),
               target=target,
               install_path=os.path.join(bld.env['LIBDIR'], 'pkgconfig'),
               exec_prefix='${prefix}',
@@ -900,21 +583,64 @@ def build_pc(bld, name, version, version_suffix, libs, subst_dict={}):
 
     obj.__dict__.update(subst_dict)
 
+def build_dir(name, subdir):
+    if is_child():
+        return os.path.join('build', name, subdir)
+    else:
+        return os.path.join('build', subdir)
 
-def build_dox(bld,
-              name,
-              version,
-              srcdir,
-              blddir,
-              outdir='',
-              versioned=True,
-              install_man=True):
+
+def make_simple_dox(name):
+    "Clean up messy Doxygen documentation after it is built"
+    name = name.lower()
+    NAME = name.upper()
+    try:
+        top = os.getcwd()
+        os.chdir(build_dir(name, 'doc/html'))
+        page = 'group__%s.html' % name
+        if not os.path.exists(page):
+            return
+        for i in [
+            ['%s_API ' % NAME, ''],
+            ['%s_DEPRECATED ' % NAME, ''],
+            ['group__%s.html' % name, ''],
+            ['&#160;', ''],
+            [r'<script.*><\/script>', ''],
+            [r'<hr\/><a name="details" id="details"><\/a><h2>.*<\/h2>', ''],
+            [r'<link href=\"tabs.css\" rel=\"stylesheet\" type=\"text\/css\"\/>',
+             ''],
+            [r'<img class=\"footer\" src=\"doxygen.png\" alt=\"doxygen\"\/>',
+             'Doxygen']]:
+            os.system("sed -i 's/%s/%s/g' %s" % (i[0], i[1], page))
+        os.rename('group__%s.html' % name, 'index.html')
+        for i in (glob.glob('*.png') +
+                  glob.glob('*.html') +
+                  glob.glob('*.js') +
+                  glob.glob('*.css')):
+            if i != 'index.html' and i != 'style.css':
+                os.remove(i)
+        os.chdir(top)
+        os.chdir(build_dir(name, 'doc/man/man3'))
+        for i in glob.glob('*.3'):
+            os.system("sed -i 's/%s_API //' %s" % (NAME, i))
+        for i in glob.glob('_*'):
+            os.remove(i)
+        os.chdir(top)
+    except Exception as e:
+        Logs.error("Failed to fix up %s documentation: %s" % (name, e))
+
+
+def build_dox(bld, name, version, srcdir, blddir, outdir='', versioned=True):
     """Build Doxygen API documentation"""
     if not bld.env['DOCS']:
         return
 
-    # Doxygen paths in are relative to the doxygen file
-    src_dir = bld.path.srcpath()
+    # Doxygen paths in are relative to the doxygen file, not build directory
+    if is_child():
+        src_dir = os.path.join(srcdir, name.lower())
+    else:
+        src_dir = srcdir
+
     subst_tg = bld(features='subst',
                    source='doc/reference.doxygen.in',
                    target='doc/reference.doxygen',
@@ -942,13 +668,10 @@ def build_dox(bld,
     bld.install_files(
         os.path.join('${DOCDIR}', outname, outdir, 'html'),
         bld.path.get_bld().ant_glob('doc/html/*'))
-
-    if install_man:
-        for i in range(1, 8):
-            bld.install_files(
-                '${MANDIR}/man%d' % i,
-                bld.path.get_bld().ant_glob('doc/man/man%d/*' % i,
-                                            excl='**/_*'))
+    for i in range(1, 8):
+        bld.install_files('${MANDIR}/man%d' % i,
+                          bld.path.get_bld().ant_glob('doc/man/man%d/*' % i,
+                                                      excl='**/_*'))
 
 
 def build_version_files(header_path, source_path, domain, major, minor, micro):
@@ -983,7 +706,6 @@ def build_version_files(header_path, source_path, domain, major, minor, micro):
 
     return None
 
-
 def build_i18n_pot(bld, srcdir, dir, name, sources, copyright_holder=None):
     Logs.info('Generating pot file from %s' % name)
     pot_file = '%s.pot' % name
@@ -1002,7 +724,6 @@ def build_i18n_pot(bld, srcdir, dir, name, sources, copyright_holder=None):
     Logs.info('Updating ' + pot_file)
     subprocess.call(cmd, cwd=os.path.join(srcdir, dir))
 
-
 def build_i18n_po(bld, srcdir, dir, name, sources, copyright_holder=None):
     pwd = os.getcwd()
     os.chdir(os.path.join(srcdir, dir))
@@ -1016,7 +737,6 @@ def build_i18n_po(bld, srcdir, dir, name, sources, copyright_holder=None):
         Logs.info('Updating ' + po_file)
         subprocess.call(cmd)
     os.chdir(pwd)
-
 
 def build_i18n_mo(bld, srcdir, dir, name, sources, copyright_holder=None):
     pwd = os.getcwd()
@@ -1034,12 +754,10 @@ def build_i18n_mo(bld, srcdir, dir, name, sources, copyright_holder=None):
         subprocess.call(cmd)
     os.chdir(pwd)
 
-
 def build_i18n(bld, srcdir, dir, name, sources, copyright_holder=None):
     build_i18n_pot(bld, srcdir, dir, name, sources, copyright_holder)
     build_i18n_po(bld, srcdir, dir, name, sources, copyright_holder)
     build_i18n_mo(bld, srcdir, dir, name, sources, copyright_holder)
-
 
 class ExecutionEnvironment:
     """Context that sets system environment variables for program execution"""
@@ -1057,7 +775,7 @@ class ExecutionEnvironment:
         os.environ.update(self.diff)
 
     def __str__(self):
-        return '\n'.join(['%s="%s"' % (k, v) for k, v in self.diff.items()])
+        return '\n'.join({'%s="%s"' % (k, v) for k, v in self.diff.items()})
 
     def __enter__(self):
         return self
@@ -1065,41 +783,15 @@ class ExecutionEnvironment:
     def __exit__(self, type, value, traceback):
         os.environ = self.original_environ
 
-
-class RunContext(Build.BuildContext):
-    "runs an executable from the build directory"
-    cmd = 'run'
-
-    def execute(self):
-        self.restore()
-        if not self.all_envs:
-            self.load_envs()
-
-        with ExecutionEnvironment(self.env.AUTOWAF_RUN_ENV) as env:
-            if Options.options.verbose:
-                Logs.pprint('GREEN', str(env) + '\n')
-
-            if Options.options.cmd:
-                Logs.pprint('GREEN', 'Running %s' % Options.options.cmd)
-                subprocess.call(Options.options.cmd, shell=True)
-            else:
-                Logs.error("error: Missing --cmd option for run command")
-
-
 def show_diff(from_lines, to_lines, from_filename, to_filename):
     import difflib
     import sys
 
-    same = True
     for line in difflib.unified_diff(
             from_lines, to_lines,
             fromfile=os.path.abspath(from_filename),
             tofile=os.path.abspath(to_filename)):
         sys.stderr.write(line)
-        same = False
-
-    return same
-
 
 def test_file_equals(patha, pathb):
     import filecmp
@@ -1115,15 +807,15 @@ def test_file_equals(patha, pathb):
 
     with io.open(patha, 'rU', encoding='utf-8') as fa:
         with io.open(pathb, 'rU', encoding='utf-8') as fb:
-            return show_diff(fa.readlines(), fb.readlines(), patha, pathb)
+            show_diff(fa.readlines(), fb.readlines(), patha, pathb)
 
+    return False
 
 def bench_time():
-    if hasattr(time, 'perf_counter'):  # Added in Python 3.3
+    if hasattr(time, 'perf_counter'): # Added in Python 3.3
         return time.perf_counter()
     else:
         return time.time()
-
 
 class TestOutput:
     """Test output that is truthy if result is as expected"""
@@ -1137,12 +829,10 @@ class TestOutput:
 
     __nonzero__ = __bool__
 
-
 def is_string(s):
     if sys.version_info[0] < 3:
         return isinstance(s, basestring)
     return isinstance(s, str)
-
 
 class TestScope:
     """Scope for running tests that maintains pass/fail statistics"""
@@ -1154,26 +844,13 @@ class TestScope:
         self.n_total = 0
 
     def run(self, test, **kwargs):
-        if type(test) == list and 'name' not in kwargs:
-            import pipes
-            kwargs['name'] = ' '.join(map(pipes.quote, test))
-
-        if Options.options.test_filter and 'name' in kwargs:
-            import re
-            found = False
-            for scope in self.tst.stack:
-                if re.search(Options.options.test_filter, scope.name):
-                    found = True
-                    break
-
-            if (not found and
-                not re.search(Options.options.test_filter, self.name) and
-                not re.search(Options.options.test_filter, kwargs['name'])):
-                return True
-
         if callable(test):
             output = self._run_callable(test, **kwargs)
         elif type(test) == list:
+            if 'name' not in kwargs:
+                import pipes
+                kwargs['name'] = ' '.join(map(pipes.quote, test))
+
             output = self._run_command(test, **kwargs)
         else:
             raise Exception("Unknown test type")
@@ -1191,10 +868,9 @@ class TestScope:
         if 'stderr' in kwargs and kwargs['stderr'] == NONEMPTY:
             # Run with a temp file for stderr and check that it is non-empty
             import tempfile
-            with tempfile.TemporaryFile() as stderr:
+            with tempfile.TemporaryFile(mode='w') as stderr:
                 kwargs['stderr'] = stderr
                 output = self.run(test, **kwargs)
-                stderr.seek(0, 2)  # Seek to end
                 return (output if not output else
                         self.run(
                             lambda: stderr.tell() > 0,
@@ -1224,45 +900,27 @@ class TestScope:
               stdout=None,
               stderr=None,
               verbosity=1):
-        import tempfile
-
         def stream(s):
             return open(s, 'wb') if type(s) == str else s
 
         if verbosity > 1:
             self.tst.log_good('RUN     ', name)
 
-        if Options.options.wrapper:
-            import shlex
-            test = shlex.split(Options.options.wrapper) + test
+        if Options.options.test_wrapper:
+            test = [Options.options.test_wrapper] + test
 
         output = TestOutput(expected)
         with open(os.devnull, 'wb') as null:
             out = null if verbosity < 3 and not stdout else stdout
-            tmp_err = None
-            if stderr or verbosity >= 2:
-                err = stderr
-            else:
-                tmp_err = tempfile.TemporaryFile()
-                err = tmp_err
-
+            err = null if verbosity < 2 and not stderr else stderr
             proc = subprocess.Popen(test, stdin=stdin, stdout=out, stderr=err)
             output.stdout, output.stderr = proc.communicate()
             output.result = proc.returncode
-
-            if tmp_err is not None:
-                if output.result != expected:
-                    tmp_err.seek(0)
-                    for line in tmp_err:
-                        sys.stderr.write(line.decode('utf-8'))
-
-                tmp_err.close()
 
         if output and verbosity > 0:
             self.tst.log_good('      OK', name)
 
         return output
-
 
 class TestContext(Build.BuildContext):
     "runs test suite"
@@ -1306,19 +964,17 @@ class TestContext(Build.BuildContext):
         self.max_depth = max(self.max_depth, len(self.stack) - 1)
 
         bld_dir = node.get_bld().parent
-
-        if hasattr(wscript_module, 'test'):
-            self.original_dir = os.getcwd()
-            Logs.info("Waf: Entering directory `%s'", bld_dir)
-            os.chdir(str(bld_dir))
-
-            parent_is_top = str(node.parent) == Context.top_dir
-            if not self.env.NO_COVERAGE and parent_is_top:
-                self.clear_coverage()
-
+        if bld_dir != self.path.get_bld():
             Logs.info('')
-            self.log_good('=' * 10, 'Running %s tests\n', group_name)
 
+        self.original_dir = os.getcwd()
+        Logs.info("Waf: Entering directory `%s'\n", bld_dir)
+        os.chdir(str(bld_dir))
+
+        if str(node.parent) == Context.top_dir:
+            self.clear_coverage()
+
+        self.log_good('=' * 10, 'Running %s tests', group_name)
         super(TestContext, self).pre_recurse(node)
 
     def test_result(self, success):
@@ -1339,12 +995,9 @@ class TestContext(Build.BuildContext):
         duration = (bench_time() - self.start_time) * 1000.0
         is_top = str(node.parent) == str(Context.top_dir)
 
-        wscript_module = Context.load_module(node.abspath())
-        if not hasattr(wscript_module, 'test'):
-            os.chdir(self.original_dir)
-            return
+        if is_top and self.max_depth > 1:
+            Logs.info('')
 
-        Logs.info('')
         self.log_good('=' * 10, '%d tests from %s ran (%d ms total)',
                       scope.n_total, scope.name, duration)
 
@@ -1353,15 +1006,16 @@ class TestContext(Build.BuildContext):
                 self.gen_coverage()
 
             if os.path.exists('coverage/index.html'):
-                self.log_good('REPORT', '<file://%s>',
+                self.log_good('COVERAGE', '<file://%s>',
                               os.path.abspath('coverage/index.html'))
 
         successes = scope.n_total - scope.n_failed
         Logs.pprint('GREEN', '[  PASSED  ] %d tests' % successes)
         if scope.n_failed > 0:
             Logs.pprint('RED', '[  FAILED  ] %d tests' % scope.n_failed)
+        if is_top:
+            Logs.info("\nWaf: Leaving directory `%s'" % os.getcwd())
 
-        Logs.info("\nWaf: Leaving directory `%s'" % os.getcwd())
         os.chdir(self.original_dir)
 
     def execute(self):
@@ -1400,8 +1054,8 @@ class TestContext(Build.BuildContext):
                 subprocess.call(['lcov', '-z', '-d', str(self.path)],
                                 stdout=log, stderr=log)
 
-        except Exception as e:
-            Logs.warn('Failed to run lcov to clear old coverage data (%s)' % e)
+        except Exception:
+            Logs.warn('Failed to run lcov to clear old coverage data')
 
     def gen_coverage(self):
         """Generate coverage data and report"""
@@ -1424,23 +1078,8 @@ class TestContext(Build.BuildContext):
                                  'cov.lcov'],
                                 stdout=log, stderr=log)
 
-            summary = subprocess.check_output(
-                ['lcov', '--summary',
-                 '--rc', 'lcov_branch_coverage=1',
-                 'cov.lcov'],
-                stderr=subprocess.STDOUT).decode('ascii')
-
-            import re
-            lines = re.search(r'lines\.*: (.*)%.*', summary).group(1)
-            functions = re.search(r'functions\.*: (.*)%.*', summary).group(1)
-            branches = re.search(r'branches\.*: (.*)%.*', summary).group(1)
-            self.log_good(
-                'COVERAGE', '%s%% lines, %s%% functions, %s%% branches',
-                lines, functions, branches)
-
-        except Exception as e:
-            Logs.warn('Failed to run lcov to generate coverage report (%s)')
-
+        except Exception:
+            Logs.warn('Failed to run lcov to generate coverage report')
 
 class TestGroup:
     def __init__(self, tst, suitename, name, **kwargs):
@@ -1481,7 +1120,6 @@ class TestGroup:
             self.tst.log_bad('-' * 10, '%d/%d tests from %s (%d ms total)',
                              n_passed, scope.n_total, self.label(), duration)
 
-
 def run_ldconfig(ctx):
     should_run = (ctx.cmd == 'install' and
                   not ctx.env['RAN_LDCONFIG'] and
@@ -1497,7 +1135,265 @@ def run_ldconfig(ctx):
         except Exception:
             pass
 
+def get_rdf_news(name,
+                 in_files,
+                 top_entries=None,
+                 extra_entries=None,
+                 dev_dist=None):
+    import rdflib
+    from time import strptime
+
+    doap = rdflib.Namespace('http://usefulinc.com/ns/doap#')
+    dcs  = rdflib.Namespace('http://ontologi.es/doap-changeset#')
+    rdfs = rdflib.Namespace('http://www.w3.org/2000/01/rdf-schema#')
+    foaf = rdflib.Namespace('http://xmlns.com/foaf/0.1/')
+    rdf  = rdflib.Namespace('http://www.w3.org/1999/02/22-rdf-syntax-ns#')
+    m    = rdflib.ConjunctiveGraph()
+
+    try:
+        for i in in_files:
+            m.parse(i, format='n3')
+    except Exception:
+        Logs.warn('Error parsing data, unable to generate NEWS')
+        return
+
+    proj = m.value(None, rdf.type, doap.Project)
+    for f in m.triples([proj, rdfs.seeAlso, None]):
+        if f[2].endswith('.ttl'):
+            m.parse(f[2], format='n3')
+
+    entries = {}
+    for r in m.triples([proj, doap.release, None]):
+        release   = r[2]
+        revision  = m.value(release, doap.revision, None)
+        date      = m.value(release, doap.created, None)
+        blamee    = m.value(release, dcs.blame, None)
+        changeset = m.value(release, dcs.changeset, None)
+        dist      = m.value(release, doap['file-release'], None)
+
+        if not dist:
+            Logs.warn('No file release for %s %s' % (proj, revision))
+            dist = dev_dist
+
+        if revision and date and blamee and changeset:
+            entry             = {}
+            entry['name']     = str(name)
+            entry['revision'] = str(revision)
+            entry['date']     = strptime(str(date), '%Y-%m-%d')
+            entry['status']   = 'stable' if dist != dev_dist else 'unstable'
+            entry['dist']     = str(dist)
+            entry['items']    = []
+
+            for i in m.triples([changeset, dcs.item, None]):
+                item = str(m.value(i[2], rdfs.label, None))
+                entry['items'] += [item]
+                if dist and top_entries is not None:
+                    if not str(dist) in top_entries:
+                        top_entries[str(dist)] = {'items': []}
+                    top_entries[str(dist)]['items'] += [
+                        '%s: %s' % (name, item)]
+
+            if extra_entries and dist:
+                for i in extra_entries[str(dist)]:
+                    entry['items'] += extra_entries[str(dist)]['items']
+
+            entry['blamee_name'] = str(m.value(blamee, foaf.name, None))
+            entry['blamee_mbox'] = str(m.value(blamee, foaf.mbox, None))
+
+            entries[(str(date), str(revision))] = entry
+        else:
+            Logs.warn('Ignored incomplete %s release description' % name)
+
+    return entries
+
+def write_news(entries, out_file):
+    import textwrap
+    from time import strftime
+
+    if len(entries) == 0:
+        return
+
+    news = open(out_file, 'w')
+    for e in sorted(entries.keys(), reverse=True):
+        entry = entries[e]
+        news.write('%s (%s) %s;\n' % (entry['name'], entry['revision'], entry['status']))
+        for item in entry['items']:
+            wrapped = textwrap.wrap(item, width=79)
+            news.write('\n  * ' + '\n    '.join(wrapped))
+
+        news.write('\n\n --')
+        news.write(' %s <%s>' % (entry['blamee_name'],
+                                 entry['blamee_mbox'].replace('mailto:', '')))
+
+        news.write('  %s\n\n' % (
+            strftime('%a, %d %b %Y %H:%M:%S +0000', entry['date'])))
+
+    news.close()
+
+def write_posts(entries, meta, out_dir, status='stable'):
+    "write news posts in Pelican Markdown format"
+    from time import strftime
+    try:
+        os.mkdir(out_dir)
+    except Exception:
+        pass
+
+    for i in entries:
+        entry    = entries[i]
+        revision = i[1]
+        if entry['status'] != status:
+            continue
+
+        date_str     = strftime('%Y-%m-%d', entry['date'])
+        datetime_str = strftime('%Y-%m-%d %H:%M', entry['date'])
+
+        path  = os.path.join(out_dir, '%s-%s-%s.md' % (
+            date_str, entry['name'], revision.replace('.', '-')))
+        post  = open(path, 'w')
+        title = entry['title'] if 'title' in entry else entry['name']
+        post.write('Title: %s %s\n' % (title, revision))
+        post.write('Date: %s\n' % datetime_str)
+        post.write('Slug: %s-%s\n' % (entry['name'], revision.replace('.', '-')))
+        for k in meta:
+            post.write('%s: %s\n' % (k, meta[k]))
+        post.write('\n')
+
+        url = entry['dist']
+        if entry['status'] == status:
+            post.write('[%s %s](%s) has been released.' % (
+                (entry['name'], revision, url)))
+
+        if 'description' in entry:
+            post.write('  ' + entry['description'])
+
+        post.write('\n')
+        if (len(entry['items']) > 0 and
+            not (len(entry['items']) == 1 and
+                 entry['items'][0] == 'Initial release')):
+            post.write('\nChanges:\n\n')
+            for i in entry['items']:
+                post.write(' * %s\n' % i)
+
+        post.close()
+
+def get_blurb(in_file):
+    "Get the first paragram of a Markdown formatted file, skipping the title"
+    f = open(in_file, 'r')
+    f.readline()  # Title
+    f.readline()  # Title underline
+    f.readline()  # Blank
+    out = ''
+    line = f.readline()
+    while len(line) > 0 and line != '\n':
+        out += line.replace('\n', ' ')
+        line = f.readline()
+    return out.strip()
+
+def get_news(in_file, entry_props={}):
+    """Get NEWS entries in the format expected by write_posts().
+
+    Properties that should be set on every entry can be passed in
+    `entry_props`.  If `entry_props` has a 'dist_pattern' value, it is used to
+    set the 'dist' entry of entries by substituting the version number.
+    """
+
+    import re
+    import rfc822
+
+    f       = open(in_file, 'r')
+    entries = {}
+    while True:
+        # Read header line
+        head    = f.readline()
+        matches = re.compile(r'([^ ]*) \((.*)\) ([a-zA-z]*);').match(head)
+        if matches is None:
+            break
+
+        entry             = {}
+        entry['name']     = matches.group(1)
+        entry['revision'] = matches.group(2)
+        entry['status']   = matches.group(3)
+        entry['items']    = []
+        if 'dist_pattern' in entry_props:
+            entry['dist'] = entry_props['dist_pattern'] % entry['revision']
+
+        # Read blank line after header
+        if f.readline() != '\n':
+            raise SyntaxError('expected blank line after NEWS header')
+
+        def add_item(item):
+            if len(item) > 0:
+                entry['items'] += [item.replace('\n', ' ').strip()]
+
+        # Read entries for this revision
+        item = ''
+        line = ''
+        while line != '\n':
+            line = f.readline()
+            if line.startswith('  * '):
+                add_item(item)
+                item = line[3:].lstrip()
+            else:
+                item += line.lstrip()
+        add_item(item)
+
+        # Read footer line
+        foot    = f.readline()
+        matches = re.compile(' -- (.*) <(.*)>  (.*)').match(foot)
+        entry['date']        = rfc822.parsedate(matches.group(3))
+        entry['blamee_name'] = matches.group(1)
+        entry['blamee_mbox'] = matches.group(2)
+        entry.update(entry_props)
+        entries[(entry['date'], entry['revision'])] = entry
+
+        # Skip trailing blank line before next entry
+        f.readline()
+
+    f.close()
+
+    return entries
+
+def news_to_posts(news_file, entry_props, post_meta, default_post_dir):
+    post_dir = os.getenv('POST_DIR')
+    if not post_dir:
+        post_dir = default_post_dir
+        sys.stderr.write('POST_DIR not set in environment, writing to %s\n' % post_dir)
+    else:
+        sys.stderr.write('writing posts to %s\n' % post_dir)
+
+    entries = get_news(news_file, entry_props)
+    write_posts(entries, post_meta, post_dir)
 
 def run_script(cmds):
     for cmd in cmds:
         subprocess.check_call(cmd, shell=True)
+
+def release(name, version, dist_name=None):
+    if dist_name is None:
+        dist_name = name.lower()
+
+    dist = '%s-%s.tar.bz2' % (dist_name or name.lower(), version)
+    try:
+        os.remove(dist)
+        os.remove(dist + '.sig')
+    except Exception:
+        pass
+
+    status = subprocess.check_output('git status --porcelain', shell=True)
+    if status:
+        Logs.error('error: git working copy is dirty\n' + status)
+        raise Exception('git working copy is dirty')
+
+    head = subprocess.check_output('git show -s --oneline', shell=True)
+    head_summary = head[8:].strip().lower()
+    expected_summary = '%s %s' % (name.lower(), version)
+    if head_summary != expected_summary:
+        raise Exception('latest commit "%s" does not match "%s"' % (
+            head_summary, expected_summary))
+
+    run_script(['./waf configure --docs',
+                './waf',
+                './waf distcheck',
+                './waf posts',
+                'gpg -b %s' % dist,
+                'git tag -s v%s -m "%s %s"' % (version, name, version)])
