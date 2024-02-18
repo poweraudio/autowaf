@@ -1,3 +1,14 @@
+**PowerAudio fork of autowaf**
+
+This fork of autowaf contains the following changes:
+
+* Added a branch with an older version of autowaf.py, but the same version of
+  waf. Some projects need this. See [`old-autowaf-py`].
+
+[`old-autowaf-py`]: https://github.com/poweraudio/autowaf/tree/old-autowaf-py
+
+---
+
 Autowaf
 =======
 
